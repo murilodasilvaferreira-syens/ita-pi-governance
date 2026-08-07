@@ -1,0 +1,72 @@
+{
+  "$schema": "./settings.schema.json",
+  "environment": "ITA-PROD",
+  "site": "Itatiba",
+
+  "pi": {
+    "dataArchive": "ITA_NOVECARE",
+    "afServer": "BRITAMS01-SV01",
+    "afDatabase": "ITA_NOVECARE",
+    "pointNameFilter": "*",
+    "eventFrameTemplates": [],
+    "afSdkAssemblyPath": [
+      "C:\\Program Files (x86)\\PIPC\\AF\\PublicAssemblies\\4.0\\OSIsoft.AFSDK.dll",
+      "C:\\Program Files\\PIPC\\AF\\PublicAssemblies\\4.0\\OSIsoft.AFSDK.dll"
+    ]
+  },
+
+  "output": {
+    "baseDir": "D:\\PI_Inventory",
+    "fallbackBaseDir": "C:\\PI_Inventory",
+    "rawFolderName": "raw",
+    "logFolderName": "logs",
+    "format": "csv",
+    "delimiter": ","
+  },
+
+  "transfer": {
+    "enabled": true,
+    "oneDrivePath": "C:\\Users\\dasi0558\\Syensqo SA\\ITA-DIGITAL-OPS - Documentos\\01_Landing\\PI_System"
+  },
+
+  "thresholds": {
+    "staleThresholdHours": 24,
+    "eventFrameLookbackDays": 30,
+    "retentionDays": 60,
+    "minResolutionRate": 0.9,
+    "resolutionRateBaseline": null,
+    "resolutionRateSeverity": "warn",
+    "resolutionFailureSampleSize": 10,
+    "maxDeltaGapHours": 48
+  },
+
+  "datasets": {
+    "metadata": [
+      "pipoints",
+      "digitalsets",
+      "elements",
+      "attributes",
+      "templates",
+      "eventframes",
+      "analyses",
+      "enumsets",
+      "uom",
+      "tables"
+    ],
+    "health": [
+      "pipoint_health"
+    ]
+  },
+
+  "sensitiveHints": {
+    "patterns": [
+      "(?i)(password|pwd|passwd)\\s*[:=]",
+      "(?i)(user\\s*id|userid|uid)\\s*[:=]",
+      "(?i)(connection\\s*string|data\\s*source|initial\\s*catalog)\\s*[:=]",
+      "(?i)\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b",
+      "(?i)\\b[a-z]:\\\\",
+      "(?i)\\.(csv|xlsx?|mdb|accdb|txt|udl|ini|config|xml)\\b",
+      "(?i)\\b(https?|ftp|opc\\.tcp)://"
+    ]
+  }
+}

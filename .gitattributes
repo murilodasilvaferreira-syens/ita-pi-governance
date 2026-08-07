@@ -1,0 +1,13 @@
+# Line endings determinísticos: o projeto é sensível a encoding (ver docs/armadilhas.md 8).
+* text=auto
+
+# PowerShell roda em Windows e os arquivos têm BOM UTF-8 obrigatório.
+*.ps1  text eol=crlf
+*.psm1 text eol=crlf
+*.psd1 text eol=crlf
+
+*.md    text eol=lf
+*.sql   text eol=lf
+*.yml   text eol=lf
+*.json  text eol=lf
+*.ipynb text eol=lf

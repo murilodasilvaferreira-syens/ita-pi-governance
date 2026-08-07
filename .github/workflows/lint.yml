@@ -1,0 +1,72 @@
+name: lint
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  read-only-guard:
+    name: Regra read-only sobre o PI
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verificar ausência de escrita no PI System
+        shell: powershell
+        run: .\tests\Test-ReadOnlyGuard.ps1
+
+  source-encoding:
+    name: BOM UTF-8 nos arquivos PowerShell
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verificar encoding
+        shell: powershell
+        run: .\tests\Test-SourceEncoding.ps1
+
+  script-analyzer:
+    name: PSScriptAnalyzer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar PSScriptAnalyzer
+        shell: powershell
+        run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
+
+      - name: Analisar
+        shell: powershell
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Settings .\PSScriptAnalyzerSettings.psd1
+          if ($results) {
+              $results | Format-Table Severity, ScriptName, Line, RuleName, Message -AutoSize | Out-String -Width 200 | Write-Host
+          }
+          $blocking = @($results | Where-Object { $_.Severity -in 'Error', 'Warning' })
+          if ($blocking.Count -gt 0) {
+              Write-Host ("PSScriptAnalyzer: {0} problema(s) bloqueante(s)." -f $blocking.Count) -ForegroundColor Red
+              exit 1
+          }
+          Write-Host 'PSScriptAnalyzer: sem problemas bloqueantes.' -ForegroundColor Green
+
+  module-manifest:
+    name: Manifesto e sintaxe do módulo
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validar sintaxe e manifesto
+        shell: powershell
+        run: |
+          $failed = $false
+          Get-ChildItem -Recurse -Include *.ps1, *.psm1, *.psd1 | ForEach-Object {
+              $errors = $null
+              [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors) | Out-Null
+              if ($errors) {
+                  $failed = $true
+                  Write-Host ("ERRO de sintaxe em {0}" -f $_.Name) -ForegroundColor Red
+                  $errors | ForEach-Object { Write-Host ("  L{0}: {1}" -f $_.Extent.StartLineNumber, $_.Message) }
+              }
+          }
+          $manifest = Test-ModuleManifest .\src\PIInventory.psd1
+          Write-Host ("Manifesto OK: {0} v{1}, {2} funções exportadas." -f $manifest.Name, $manifest.Version, $manifest.ExportedFunctions.Count)
+          if ($failed) { exit 1 }

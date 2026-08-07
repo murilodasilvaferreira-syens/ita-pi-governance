@@ -1,0 +1,30 @@
+# Override de configuração específico de máquina (paths locais, nunca versionado)
+config/settings.local.json
+
+# Saídas de execução — o repositório nunca guarda dados do PI
+out/
+raw/
+logs/
+*.csv
+*.parquet
+_manifest.json
+_transfer.json
+
+# PowerShell
+*.ps1xml.bak
+PSScriptAnalyzerResults.*
+
+# Editores
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Sistema operacional
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Notebooks
+.ipynb_checkpoints/
+__pycache__/
