@@ -21,6 +21,9 @@
     .PARAMETER ConfigPath
         Caminho do settings.json. Padrão: <repo>\config\settings.json.
 
+    .PARAMETER Environment
+        Restringe a coleta aos ambientes indicados. Padrão: todos os habilitados em `environments`.
+
     .PARAMETER Dataset
         Sobrescreve a lista de datasets de `datasets.health`.
 
@@ -36,6 +39,7 @@
 [CmdletBinding()]
 param(
     [string] $ConfigPath,
+    [string[]] $Environment,
     [string[]] $Dataset,
     [switch] $SkipTransfer,
     [switch] $SkipRetention
@@ -53,28 +57,35 @@ catch {
 
 $arguments = @{ RunType = 'health' }
 if ($ConfigPath) { $arguments['ConfigPath'] = $ConfigPath }
+if ($Environment) { $arguments['Environment'] = $Environment }
 if ($Dataset) { $arguments['Dataset'] = $Dataset }
 if ($SkipTransfer) { $arguments['SkipTransfer'] = $true }
 if ($SkipRetention) { $arguments['SkipRetention'] = $true }
 
 $result = Invoke-InventorySnapshot @arguments
 
-if ($null -ne $result.Context) {
+foreach ($run in $result.Runs) {
     Write-Host ''
-    $result.Context.Datasets |
+    Write-Host ("=== ambiente: {0} | exit {1} ===" -f $run.Environment, $run.ExitCode) -ForegroundColor Cyan
+
+    if ($null -eq $run.Context) {
+        Write-Host ("    FALHA: {0}" -f $run.Error) -ForegroundColor Red
+        continue
+    }
+
+    $run.Context.Datasets |
         Format-Table dataset, status, row_count, duration_ms, file -AutoSize |
-        Out-String -Width 160 |
+        Out-String -Width 170 |
         Write-Host
 
-    $health = $result.Context.Datasets | Where-Object { $_.dataset -eq 'pipoint_health' }
+    $health = $run.Context.Datasets | Where-Object { $_.dataset -eq 'pipoint_health' }
     if ($null -ne $health -and $null -ne $health.metrics) {
-        Write-Host ("stale={0}  bad={1}  sem_dados={2}  (limite {3} h)" -f
+        Write-Host ("    stale={0}  bad={1}  sem_dados={2}  (limite {3} h)" -f
             $health.metrics['stale_count'], $health.metrics['bad_count'],
             $health.metrics['never_fed_count'], $health.metrics['stale_threshold_hours'])
     }
 }
 
-$statusText = if ($null -ne $result.Manifest) { $result.Manifest.status } else { 'fatal' }
-Write-Host ("RESULTADO: {0} | exit {1}" -f $statusText, $result.ExitCode) -ForegroundColor Cyan
+Write-Host ("RESULTADO: {0} ambiente(s) | exit {1}" -f $result.Runs.Count, $result.ExitCode) -ForegroundColor Cyan
 
 exit $result.ExitCode

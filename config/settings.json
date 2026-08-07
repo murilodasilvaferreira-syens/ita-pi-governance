@@ -1,14 +1,47 @@
 {
   "$schema": "./settings.schema.json",
-  "environment": "ITA-PROD",
-  "site": "Itatiba",
+
+  "environments": [
+    {
+      "id": "ita-site",
+      "name": "Itatiba — Site (Ring 0)",
+      "tier": "site",
+      "site": "ITA",
+      "siteName": "Itatiba",
+      "enabled": true,
+      "dataArchive": "ITA_NOVECARE",
+      "afServer": "BRITAMS01-SV01",
+      "afDatabase": "ITA_NOVECARE",
+      "pointNameFilter": "*",
+      "eventFrameTemplates": [],
+      "eventFrameLookbackDays": 30,
+      "knownDegradations": []
+    },
+    {
+      "id": "ita-cloud",
+      "name": "Itatiba — Cloud (Ring 1)",
+      "tier": "cloud",
+      "site": "ITA",
+      "siteName": "Itatiba",
+      "enabled": true,
+      "dataArchive": "ASEW1PSTEKPDA01",
+      "afServer": "asew1pstekpAF02",
+      "afDatabase": "ITA_NOVECARE",
+      "pointNameFilter": "*",
+      "eventFrameTemplates": [],
+      "eventFrameLookbackDays": 30,
+      "knownDegradations": [
+        {
+          "dataset": "analyses",
+          "signal": "FallbackListOnly",
+          "reason": "QueryRuntimeInformation falha com 'A call to SSPI failed' neste AF Server. O inventario de analyses e coletado, mas sem status de runtime. Fica visivel no dado via status_source; nao eleva o exit code.",
+          "since": "2026-08-07"
+        }
+      ]
+    }
+  ],
 
   "pi": {
-    "dataArchive": "ITA_NOVECARE",
-    "afServer": "BRITAMS01-SV01",
-    "afDatabase": "ITA_NOVECARE",
-    "pointNameFilter": "*",
-    "eventFrameTemplates": [],
     "afSdkAssemblyPath": [
       "C:\\Program Files (x86)\\PIPC\\AF\\PublicAssemblies\\4.0\\OSIsoft.AFSDK.dll",
       "C:\\Program Files\\PIPC\\AF\\PublicAssemblies\\4.0\\OSIsoft.AFSDK.dll"
@@ -49,6 +82,7 @@
       "templates",
       "eventframes",
       "analyses",
+      "analysis_outputs",
       "enumsets",
       "uom",
       "tables"

@@ -219,85 +219,99 @@ if ($moduleLoaded) {
     }
 }
 
-# ---------------------------------------------------------------- conectividade
+# ---------------------------------------------------------------- definição dos ambientes
 
-$context = $null
+$environments = @()
 if ($moduleLoaded -and $config) {
     try {
-        $context = Initialize-PIConnection -ConfigPath $ConfigPath -RunType 'metadata'
-        Add-Check -Name 'Initialize-PIConnection' -Status 'OK' -Detail "log em $($context.LogFile)"
+        # Valida id (^[a-z0-9-]+$), unicidade e campos obrigatórios, reportando tudo de uma vez.
+        $environments = @(Get-InventoryEnvironment -ConfigPath $ConfigPath -IncludeDisabled)
+        $active = @($environments | Where-Object { $_.enabled })
+        Add-Check -Name 'Definição de ambientes' -Status 'OK' -Detail (
+            '{0} definidos, {1} habilitados: {2}' -f $environments.Count, $active.Count,
+            (($active | ForEach-Object { $_.id }) -join ', ')
+        )
     }
     catch {
-        Add-Check -Name 'Initialize-PIConnection' -Status 'FAIL' -Detail $_.Exception.Message
+        Add-Check -Name 'Definição de ambientes' -Status 'FAIL' -Detail ($_.Exception.Message -replace '\s*\r?\n\s*', ' ')
     }
 }
 
-if ($context) {
-    $pi = $context.PIServer
-    $expectedDa = [string]$config.pi.dataArchive
-    if ($pi.Name -eq $expectedDa) {
-        Add-Check -Name 'PI Data Archive' -Status 'OK' -Detail ('{0} v{1} (conectado: {2})' -f $pi.Name, $pi.ServerVersion, $pi.ConnectionInfo.IsConnected)
-    }
-    else {
-        Add-Check -Name 'PI Data Archive' -Status 'FAIL' -Detail "Conectado em '$($pi.Name)', esperado '$expectedDa'"
-    }
-
-    $af = $context.PISystem
-    $expectedAf = [string]$config.pi.afServer
-    if ($af.Name -eq $expectedAf) {
-        Add-Check -Name 'PI AF Server' -Status 'OK' -Detail ('{0} v{1}' -f $af.Name, $af.ServerVersion)
-    }
-    else {
-        Add-Check -Name 'PI AF Server' -Status 'FAIL' -Detail "Conectado em '$($af.Name)', esperado '$expectedAf'"
-    }
-
-    # O Default PI System desta máquina aponta para um servidor antigo. Ver armadilha 6.
+# O Default PI System desta máquina aponta para o AF da cloud. Ver armadilha 6.
+if ($moduleLoaded) {
     try {
         $default = (New-Object OSIsoft.AF.PISystems).DefaultPISystem
-        if ($null -ne $default -and $default.Name -ne $expectedAf) {
-            Add-Check -Name 'Default PI System' -Status 'WARN' -Detail "Aponta para '$($default.Name)' — por isso o código nunca usa DefaultPISystem"
+        if ($null -ne $default) {
+            Add-Check -Name 'Default PI System' -Status 'WARN' -Detail "Aponta para '$($default.Name)' — o código nunca usa DefaultPISystem, sempre nome explícito"
         }
     }
     catch { }
+}
 
-    $db = $context.AFDatabase
-    Add-Check -Name 'AF Database' -Status 'OK' -Detail ('{0} ({1} elementos raiz)' -f $db.Name, $db.Elements.Count)
+# ---------------------------------------------------------------- conectividade por ambiente
 
+foreach ($environmentConfig in @($environments | Where-Object { $_.enabled })) {
+    $id = [string]$environmentConfig.id
+
+    Write-Host ''
+    Write-Host ('  --- {0} | {1} | tier {2} ---' -f $id, $environmentConfig.name, $environmentConfig.tier) -ForegroundColor Cyan
+
+    $context = $null
     try {
-        $rootNames = @($db.Elements | ForEach-Object { $_.Name })
-        Add-Check -Name 'Elementos raiz' -Status 'OK' -Detail ($rootNames -join ', ')
+        $context = Initialize-PIConnection -ConfigPath $ConfigPath -Environment $id -RunType 'metadata'
+        Add-Check -Name "[$id] conexão" -Status 'OK' -Detail "log em $($context.LogFile)"
     }
     catch {
-        Add-Check -Name 'Elementos raiz' -Status 'FAIL' -Detail $_.Exception.Message
+        # Um ambiente inacessível não pode abortar a verificação dos demais.
+        Add-Check -Name "[$id] conexão" -Status 'FAIL' -Detail $_.Exception.Message
+        continue
+    }
+
+    $pi = $context.PIServer
+    Add-Check -Name "[$id] PI Data Archive" -Status 'OK' -Detail ('{0} v{1} · {2}' -f $pi.Name, $pi.ServerVersion, $context.SourceServerId)
+
+    $af = $context.PISystem
+    Add-Check -Name "[$id] AF Server" -Status 'OK' -Detail ('{0} v{1} · {2}' -f $af.Name, $af.ServerVersion, $context.SourceAFServerId)
+
+    $db = $context.AFDatabase
+    try {
+        $rootNames = @($db.Elements | ForEach-Object { $_.Name })
+        Add-Check -Name "[$id] AF Database" -Status 'OK' -Detail ('{0} · {1} · raízes: {2}' -f $db.Name, $context.SourceAFDatabaseId, ($rootNames -join ', '))
+    }
+    catch {
+        Add-Check -Name "[$id] AF Database" -Status 'FAIL' -Detail $_.Exception.Message
     }
 
     try {
-        $filter = [string]$config.pi.pointNameFilter
+        $filter = [string]$environmentConfig.pointNameFilter
         if ([string]::IsNullOrWhiteSpace($filter)) { $filter = '*' }
         $points = @([OSIsoft.AF.PI.PIPoint]::FindPIPoints($pi, $filter))
         $status = if ($points.Count -gt 0) { 'OK' } else { 'FAIL' }
-        Add-Check -Name 'Leitura de PI Points' -Status $status -Detail ("$($points.Count) tags com filtro '$filter'")
+        Add-Check -Name "[$id] leitura de PI Points" -Status $status -Detail ("$($points.Count) tags com filtro '$filter'")
     }
     catch {
-        Add-Check -Name 'Leitura de PI Points' -Status 'FAIL' -Detail $_.Exception.Message
+        Add-Check -Name "[$id] leitura de PI Points" -Status 'FAIL' -Detail $_.Exception.Message
     }
-}
 
-# ---------------------------------------------------------------- amostra de ConfigString
+    foreach ($degradation in @($environmentConfig.knownDegradations)) {
+        if ($null -eq $degradation) { continue }
+        Add-Check -Name "[$id] degradação declarada" -Status 'WARN' -Detail ('{0} / {1}' -f $degradation.dataset, $degradation.signal)
+    }
 
-if ($context -and -not $SkipSample) {
+    if ($SkipSample) { continue }
+
     try {
         $samples = New-Object System.Collections.Generic.List[object]
         $queue = New-Object System.Collections.Queue
         foreach ($element in $db.Elements) { $queue.Enqueue($element) }
 
         $visited = 0
-        while ($queue.Count -gt 0 -and $samples.Count -lt 5 -and $visited -lt 300) {
+        while ($queue.Count -gt 0 -and $samples.Count -lt 3 -and $visited -lt 300) {
             $element = $queue.Dequeue()
             $visited++
 
             foreach ($attribute in $element.Attributes) {
-                if ($samples.Count -ge 5) { break }
+                if ($samples.Count -ge 3) { break }
                 $dr = $null
                 try { $dr = $attribute.DataReferencePlugIn.Name } catch { }
                 if ($dr -notmatch '^\s*PI\s*Point\s*$') { continue }
@@ -308,10 +322,10 @@ if ($context -and -not $SkipSample) {
 
                 $parsed = ConvertFrom-AFConfigString -ConfigString $configString -DataReference $dr
                 $samples.Add([pscustomobject]@{
-                        Attribute    = $attribute.GetPath()
-                        ConfigString = $configString
-                        ResolvedTag  = $parsed.resolved_tag
-                        ParseStatus  = $parsed.parse_status
+                        ParseStatus = $parsed.parse_status
+                        ResolvedTag = $parsed.resolved_tag
+                        ServerId    = $parsed.resolved_server_id
+                        Aponta      = if ($parsed.resolved_server_id -eq $context.SourceServerId) { 'proprio DA' } else { 'OUTRO DA' }
                     }) | Out-Null
             }
 
@@ -319,20 +333,17 @@ if ($context -and -not $SkipSample) {
         }
 
         if ($samples.Count -eq 0) {
-            Add-Check -Name 'Amostra de ConfigString' -Status 'WARN' -Detail "Nenhum atributo com DR 'PI Point' nos primeiros $visited elementos"
+            Add-Check -Name "[$id] amostra de ConfigString" -Status 'WARN' -Detail "Nenhum atributo com DR 'PI Point' nos primeiros $visited elementos"
         }
         else {
             $resolved = @($samples | Where-Object { $_.ParseStatus -eq 'resolved' }).Count
             $status = if ($resolved -eq $samples.Count) { 'OK' } else { 'WARN' }
-            Add-Check -Name 'Amostra de ConfigString' -Status $status -Detail "$resolved de $($samples.Count) resolvidos"
-
-            Write-Host ''
-            Write-Host '  Amostra AF -> PI:' -ForegroundColor Cyan
-            $samples | Format-Table ParseStatus, ResolvedTag, ConfigString -AutoSize | Out-String | Write-Host
+            Add-Check -Name "[$id] amostra de ConfigString" -Status $status -Detail "$resolved de $($samples.Count) resolvidos"
+            $samples | Format-Table ParseStatus, ResolvedTag, Aponta, ServerId -AutoSize | Out-String -Width 160 | Write-Host
         }
     }
     catch {
-        Add-Check -Name 'Amostra de ConfigString' -Status 'WARN' -Detail $_.Exception.Message
+        Add-Check -Name "[$id] amostra de ConfigString" -Status 'WARN' -Detail $_.Exception.Message
     }
 }
 

@@ -18,6 +18,9 @@
     .PARAMETER ConfigPath
         Caminho do settings.json. Padrão: <repo>\config\settings.json.
 
+    .PARAMETER Environment
+        Restringe a coleta aos ambientes indicados. Padrão: todos os habilitados em `environments`.
+
     .PARAMETER Dataset
         Sobrescreve a lista de datasets de `datasets.metadata`.
 
@@ -31,11 +34,12 @@
         .\src\Invoke-MetadataSnapshot.ps1
 
     .EXAMPLE
-        .\src\Invoke-MetadataSnapshot.ps1 -Dataset attributes -SkipTransfer
+        .\src\Invoke-MetadataSnapshot.ps1 -Environment itatiba-legado -Dataset attributes -SkipTransfer
 #>
 [CmdletBinding()]
 param(
     [string] $ConfigPath,
+    [string[]] $Environment,
     [string[]] $Dataset,
     [switch] $SkipTransfer,
     [switch] $SkipRetention
@@ -53,21 +57,27 @@ catch {
 
 $arguments = @{ RunType = 'metadata' }
 if ($ConfigPath) { $arguments['ConfigPath'] = $ConfigPath }
+if ($Environment) { $arguments['Environment'] = $Environment }
 if ($Dataset) { $arguments['Dataset'] = $Dataset }
 if ($SkipTransfer) { $arguments['SkipTransfer'] = $true }
 if ($SkipRetention) { $arguments['SkipRetention'] = $true }
 
 $result = Invoke-InventorySnapshot @arguments
 
-if ($null -ne $result.Context) {
+foreach ($run in $result.Runs) {
     Write-Host ''
-    $result.Context.Datasets |
-        Format-Table dataset, status, row_count, duration_ms, file -AutoSize |
-        Out-String -Width 160 |
-        Write-Host
+    Write-Host ("=== ambiente: {0} | exit {1} ===" -f $run.Environment, $run.ExitCode) -ForegroundColor Cyan
+    if ($null -ne $run.Context) {
+        $run.Context.Datasets |
+            Format-Table dataset, status, row_count, duration_ms, file -AutoSize |
+            Out-String -Width 170 |
+            Write-Host
+    }
+    else {
+        Write-Host ("    FALHA: {0}" -f $run.Error) -ForegroundColor Red
+    }
 }
 
-$statusText = if ($null -ne $result.Manifest) { $result.Manifest.status } else { 'fatal' }
-Write-Host ("RESULTADO: {0} | exit {1}" -f $statusText, $result.ExitCode) -ForegroundColor Cyan
+Write-Host ("RESULTADO: {0} ambiente(s) | exit {1}" -f $result.Runs.Count, $result.ExitCode) -ForegroundColor Cyan
 
 exit $result.ExitCode

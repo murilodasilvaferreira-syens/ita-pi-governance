@@ -143,6 +143,102 @@ function Resolve-InventoryBaseDir {
     return $null
 }
 
+function Assert-InventoryEnvironmentList {
+    param([psobject] $Config)
+
+    if (-not $Config.PSObject.Properties['environments']) {
+        throw 'settings.json não define "environments". Ver README.'
+    }
+
+    $all = @($Config.environments)
+    if ($all.Count -eq 0) { throw 'A lista "environments" está vazia no settings.json.' }
+
+    $issues = New-Object System.Collections.Generic.List[string]
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+
+    for ($i = 0; $i -lt $all.Count; $i++) {
+        $environment = $all[$i]
+        $label = "environments[$i]"
+
+        $id = $null
+        if ($environment.PSObject.Properties['id']) { $id = [string]$environment.id }
+
+        if ([string]::IsNullOrWhiteSpace($id)) {
+            $issues.Add("$label não tem 'id'.")
+        }
+        else {
+            $label = "environments[$i] ('$id')"
+            # O id vira segmento de nome de arquivo e chave no Lakehouse: nada de espaço,
+            # maiúscula ou acento, que quebrariam o parsing do Dataflow.
+            if ($id -cnotmatch '^[a-z0-9-]+$') {
+                $issues.Add("$label tem id inválido; use apenas minúsculas, dígitos e hífen.")
+            }
+            if (-not $seen.Add($id)) {
+                $issues.Add("$label tem id duplicado.")
+            }
+        }
+
+        foreach ($required in 'dataArchive', 'afServer', 'afDatabase') {
+            $value = $null
+            if ($environment.PSObject.Properties[$required]) { $value = [string]$environment.$required }
+            if ([string]::IsNullOrWhiteSpace($value)) {
+                $issues.Add("$label não define '$required'.")
+            }
+        }
+    }
+
+    if ($issues.Count -gt 0) {
+        throw ("Configuração de ambientes inválida:" + [Environment]::NewLine + '  - ' + ($issues.ToArray() -join ([Environment]::NewLine + '  - ')))
+    }
+
+    return $all
+}
+
+function Resolve-InventoryEnvironment {
+    param(
+        [psobject] $Config,
+        [string]   $Id
+    )
+
+    $all = Assert-InventoryEnvironmentList -Config $Config
+
+    if (-not [string]::IsNullOrWhiteSpace($Id)) {
+        $match = @($all | Where-Object { $_.id -eq $Id })
+        if ($match.Count -eq 0) {
+            throw ("Ambiente '{0}' não existe. Disponíveis: {1}" -f $Id, (($all | ForEach-Object { $_.id }) -join ', '))
+        }
+        return $match[0]
+    }
+
+    $enabled = @($all | Where-Object { $_.enabled })
+    if ($enabled.Count -eq 0) { throw 'Nenhum ambiente habilitado no settings.json.' }
+    return $enabled[0]
+}
+
+function Get-DatasetSourceKind {
+    param([string] $Dataset)
+
+    # Datasets que vem so do Data Archive: as colunas de AF ficam vazias neles, porque preenche-las
+    # sugeriria uma relação com o AF Server que a linha não tem.
+    if ($Dataset -in @('pipoints', 'pipoint_health', 'digitalsets')) { return 'da' }
+    return 'af'
+}
+
+function Get-KnownDegradation {
+    param(
+        [psobject] $Context,
+        [string]   $Dataset,
+        [string]   $Signal
+    )
+
+    if (-not $Context.EnvironmentConfig.PSObject.Properties['knownDegradations']) { return $null }
+
+    foreach ($declared in @($Context.EnvironmentConfig.knownDegradations)) {
+        if ($declared.dataset -eq $Dataset -and $declared.signal -eq $Signal) { return $declared }
+    }
+    return $null
+}
+
 function Add-DatasetResult {
     param(
         [psobject] $Context,
@@ -172,6 +268,37 @@ function Add-DatasetResult {
 #endregion
 
 #region ---------------------------------------------------------------- públicos
+
+function Get-InventoryEnvironment {
+    <#
+        .SYNOPSIS
+            Lista os ambientes definidos no settings.json, validando a definição.
+        .DESCRIPTION
+            Cada ambiente é uma camada da topologia (Ring 0 site, Ring 1 cloud) com seu par
+            Data Archive + AF Database, coletada de forma independente. Uma falha num ambiente
+            não interrompe os demais.
+
+            Lança exceção descrevendo todos os problemas de uma vez se algum `id` estiver ausente,
+            fora do padrão `^[a-z0-9-]+$` ou duplicado — o id vira segmento de nome de arquivo e
+            chave no Lakehouse.
+        .PARAMETER ConfigPath
+            Caminho do settings.json.
+        .PARAMETER IncludeDisabled
+            Inclui também os ambientes com `enabled: false`.
+        .OUTPUTS
+            Lista de objetos de ambiente.
+    #>
+    [CmdletBinding()]
+    param(
+        [string] $ConfigPath,
+        [switch] $IncludeDisabled
+    )
+
+    $config = Get-InventoryConfiguration -ConfigPath $ConfigPath
+    $all = Assert-InventoryEnvironmentList -Config $config
+    if ($IncludeDisabled) { return $all }
+    return @($all | Where-Object { $_.enabled })
+}
 
 function Import-PISdk {
     <#
@@ -363,7 +490,7 @@ function Write-InventoryOutput {
         $delimiter = [string]$Context.Config.output.delimiter
     }
 
-    $fileName = '{0}__{1}.csv' -f $Dataset, $Context.SnapshotStamp
+    $fileName = '{0}__{1}__{2}.csv' -f $Dataset, $Context.Environment, $Context.SnapshotStamp
     $path = Join-Path $Context.SnapshotPath $fileName
 
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
@@ -381,7 +508,35 @@ function Write-InventoryOutput {
         }
         $snapshotTs = $snapshotTs.ToString($dateFormat)
     }
-    $rowPrefix = '{0}{1}{2}' -f $Context.SnapshotDate, $delimiter, $snapshotTs
+
+    # Identidade da origem, repetida em toda linha. Nome é rótulo, GUID é chave: neste ambiente
+    # dois AF Databases distintos se chamam ITA_NOVECARE e o mesmo Data Archive aparece escrito
+    # de quatro formas diferentes nos ConfigStrings.
+    $isAfDataset = (Get-DatasetSourceKind -Dataset $Dataset) -eq 'af'
+    $identityColumns = @(
+        'environment', 'tier', 'site', 'snapshot_date', 'snapshot_ts',
+        'source_server', 'source_server_id',
+        'source_af_server', 'source_af_server_id',
+        'source_af_database', 'source_af_database_id'
+    )
+    $identityValues = @(
+        $Context.Environment
+        $Context.Tier
+        $Context.Site
+        $Context.SnapshotDate
+        $snapshotTs
+        $Context.SourceServer
+        $Context.SourceServerId
+        $(if ($isAfDataset) { $Context.SourceAFServer } else { '' })
+        $(if ($isAfDataset) { $Context.SourceAFServerId } else { '' })
+        $(if ($isAfDataset) { $Context.SourceAFDatabase } else { '' })
+        $(if ($isAfDataset) { $Context.SourceAFDatabaseId } else { '' })
+    ) | ForEach-Object {
+        $text = [string]$_
+        if ($text.IndexOfAny($special) -ge 0) { '"' + $text.Replace('"', '""') + '"' } else { $text }
+    }
+
+    $rowPrefix = $identityValues -join $delimiter
 
     # A formatação é inline de propósito: como função, o custo de chamada do PowerShell dominava
     # a gravação (~9 s para 87 mil campos contra ~1 s aqui).
@@ -389,7 +544,7 @@ function Write-InventoryOutput {
     $encoding = New-Object System.Text.UTF8Encoding($false)
     $writer = New-Object System.IO.StreamWriter($path, $false, $encoding)
     try {
-        $writer.WriteLine(((@('snapshot_date', 'snapshot_ts') + $columns) -join $delimiter))
+        $writer.WriteLine((($identityColumns + $columns) -join $delimiter))
 
         foreach ($item in $InputObject) {
             [void]$builder.Clear()
@@ -480,13 +635,18 @@ function ConvertFrom-AFConfigString {
 
             O caractere '?' é ilegal em nome de tag do PI, então sempre delimita sufixo: ou o GUID
             do servidor, ou o ID do ponto, ou parâmetros. Nunca faz parte do nome.
+
+            `resolved_server_id` é a chave confiável de servidor. O mesmo Data Archive aparece
+            escrito de quatro formas neste ambiente (nome PI, hostname, FQDN e FQDN alternativo),
+            mas o GUID é sempre o mesmo. Com mais de um Data Archive coletado, comparar por nome
+            produziria join errado.
         .PARAMETER ConfigString
             Valor bruto do ConfigString.
         .PARAMETER DataReference
             Nome do plug-in de Data Reference. Só 'PI Point' é interpretado.
         .OUTPUTS
-            PSCustomObject com resolved_server, resolved_tag, resolved_point_id,
-            is_dynamic_reference e parse_status.
+            PSCustomObject com resolved_server, resolved_server_id, resolved_tag,
+            resolved_point_id, is_dynamic_reference e parse_status.
     #>
     [CmdletBinding()]
     param(
@@ -502,6 +662,7 @@ function ConvertFrom-AFConfigString {
 
     $result = [pscustomobject]@{
         resolved_server      = $null
+        resolved_server_id   = $null
         resolved_tag         = $null
         resolved_point_id    = $null
         is_dynamic_reference = $false
@@ -545,7 +706,16 @@ function ConvertFrom-AFConfigString {
 
     if (-not [string]::IsNullOrWhiteSpace($serverSegment)) {
         $queryIndex = $serverSegment.IndexOf('?')
-        $result.resolved_server = if ($queryIndex -ge 0) { $serverSegment.Substring(0, $queryIndex) } else { $serverSegment }
+        if ($queryIndex -ge 0) {
+            $result.resolved_server = $serverSegment.Substring(0, $queryIndex)
+            $suffix = $serverSegment.Substring($queryIndex + 1)
+            if ($suffix -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}') {
+                $result.resolved_server_id = $Matches[0].ToLowerInvariant()
+            }
+        }
+        else {
+            $result.resolved_server = $serverSegment
+        }
     }
 
     $queryIndex = $tagSegment.IndexOf('?')
@@ -596,6 +766,8 @@ function Initialize-PIConnection {
     param(
         [string] $ConfigPath,
 
+        [string] $Environment,
+
         [ValidateSet('metadata', 'health')]
         [string] $RunType = 'metadata',
 
@@ -603,6 +775,10 @@ function Initialize-PIConnection {
     )
 
     $config = Get-InventoryConfiguration -ConfigPath $ConfigPath
+
+    # NAO renomear para $environment: o parametro [string] $Environment e a mesma variavel
+    # (nomes sao case-insensitive) e a restricao de tipo converteria o objeto para string.
+    $environmentConfig = Resolve-InventoryEnvironment -Config $config -Id $Environment
 
     $baseCandidates = @($config.output.baseDir, $config.output.fallbackBaseDir)
     $baseDir = Resolve-InventoryBaseDir -Candidate $baseCandidates
@@ -622,7 +798,7 @@ function Initialize-PIConnection {
         }
     }
 
-    $script:InventoryLogFile = Join-Path $logPath ('{0}__{1}.log' -f $RunType, $snapshotStamp)
+    $script:InventoryLogFile = Join-Path $logPath ('{0}__{1}__{2}.log' -f $RunType, $environmentConfig.id, $snapshotStamp)
 
     Write-InventoryLog -Message ('Iniciando execução {0} (módulo {1})' -f $RunType, $script:InventoryModuleVersion) -Data @{
         config_path = $config.sourcePath
@@ -656,25 +832,27 @@ function Initialize-PIConnection {
     $sdk = Import-PISdk -AssemblyPath @($config.pi.afSdkAssemblyPath)
     Write-InventoryLog -Message ('AF SDK carregado via {0} (versão {1})' -f $sdk.method, $sdk.version)
 
-    $dataArchiveName = $config.pi.dataArchive
+    Write-InventoryLog -Message ('Ambiente: {0} — {1} (tier {2})' -f $environmentConfig.id, $environmentConfig.name, $environmentConfig.tier)
+
+    $dataArchiveName = $environmentConfig.dataArchive
     $piServers = New-Object OSIsoft.AF.PI.PIServers
     $piServer = $piServers[$dataArchiveName]
     if ($null -eq $piServer) {
         throw "PI Data Archive '$dataArchiveName' não encontrado na lista de servidores conhecidos desta máquina."
     }
     $piServer.Connect()
-    Write-InventoryLog -Message ('PI Data Archive conectado: {0} (versão {1})' -f $piServer.Name, $piServer.ServerVersion)
+    Write-InventoryLog -Message ('PI Data Archive conectado: {0} (versão {1}, id {2})' -f $piServer.Name, $piServer.ServerVersion, $piServer.ID)
 
-    $afServerName = $config.pi.afServer
+    $afServerName = $environmentConfig.afServer
     $piSystems = New-Object OSIsoft.AF.PISystems
     $afServer = $piSystems[$afServerName]
     if ($null -eq $afServer) {
-        throw "AF Server '$afServerName' não encontrado. Confira o nome (termina em S01, letra S)."
+        throw "AF Server '$afServerName' não encontrado na lista de servidores conhecidos desta máquina."
     }
     $afServer.Connect()
 
     # Get-AFDatabase -Name retorna null nesta versão; a coleção funciona. Ver armadilha 3.
-    $afDatabaseName = $config.pi.afDatabase
+    $afDatabaseName = $environmentConfig.afDatabase
     $afDatabase = $afServer.Databases[$afDatabaseName]
     if ($null -eq $afDatabase) {
         throw "AF Database '$afDatabaseName' não encontrado em '$afServerName'."
@@ -682,24 +860,36 @@ function Initialize-PIConnection {
     Write-InventoryLog -Message ('AF conectado: {0} (versão {1}), database {2}' -f $afServer.Name, $afServer.ServerVersion, $afDatabase.Name)
 
     return [pscustomobject]@{
-        RunId             = [guid]::NewGuid().ToString()
-        RunType           = $RunType
-        SnapshotTime      = $SnapshotTime
-        SnapshotDate      = $snapshotDate
-        SnapshotStamp     = $snapshotStamp
-        Config            = $config
-        SensitivePatterns = $sensitivePatterns
-        Sdk               = $sdk
-        PIServer          = $piServer
-        PISystem          = $afServer
-        AFDatabase        = $afDatabase
-        BaseDir           = $baseDir
-        UsedFallbackDir   = $usedFallback
-        SnapshotPath      = $snapshotPath
-        LogPath           = $logPath
-        LogFile           = $script:InventoryLogFile
-        ModuleVersion     = $script:InventoryModuleVersion
-        Datasets          = (New-Object System.Collections.Generic.List[object])
+        RunId              = [guid]::NewGuid().ToString()
+        RunType            = $RunType
+        Environment        = [string]$environmentConfig.id
+        EnvironmentName    = [string]$environmentConfig.name
+        Tier               = [string]$environmentConfig.tier
+        Site               = [string]$environmentConfig.site
+        SiteName           = [string]$environmentConfig.siteName
+        EnvironmentConfig  = $environmentConfig
+        SnapshotTime       = $SnapshotTime
+        SnapshotDate       = $snapshotDate
+        SnapshotStamp      = $snapshotStamp
+        Config             = $config
+        SensitivePatterns  = $sensitivePatterns
+        Sdk                = $sdk
+        PIServer           = $piServer
+        SourceServer       = [string]$piServer.Name
+        SourceServerId     = [string]$piServer.ID
+        PISystem           = $afServer
+        SourceAFServer     = [string]$afServer.Name
+        SourceAFServerId   = [string]$afServer.ID
+        AFDatabase         = $afDatabase
+        SourceAFDatabase   = [string]$afDatabase.Name
+        SourceAFDatabaseId = [string]$afDatabase.ID
+        BaseDir            = $baseDir
+        UsedFallbackDir    = $usedFallback
+        SnapshotPath       = $snapshotPath
+        LogPath            = $logPath
+        LogFile            = $script:InventoryLogFile
+        ModuleVersion      = $script:InventoryModuleVersion
+        Datasets           = (New-Object System.Collections.Generic.List[object])
     }
 }
 
@@ -746,7 +936,7 @@ function Export-PIPointInventory {
     )
 
     try {
-        $filter = if ($PSBoundParameters.ContainsKey('NameFilter')) { $NameFilter } else { [string]$Context.Config.pi.pointNameFilter }
+        $filter = if ($PSBoundParameters.ContainsKey('NameFilter')) { $NameFilter } else { [string]$Context.EnvironmentConfig.pointNameFilter }
         if ([string]::IsNullOrWhiteSpace($filter)) { $filter = '*' }
 
         Write-InventoryLog -Dataset $dataset -Message "Buscando PI Points com filtro '$filter'."
@@ -871,7 +1061,8 @@ function Export-AFAttributeInventory {
         'element_path', 'element_name', 'element_template',
         'attribute_path', 'attribute_name', 'attribute_level',
         'description', 'type', 'uom', 'categories', 'template_name',
-        'data_reference', 'config_string', 'resolved_server', 'resolved_tag', 'resolved_point_id',
+        'data_reference', 'config_string', 'resolved_server', 'resolved_server_id',
+        'resolved_tag', 'resolved_point_id',
         'is_dynamic_reference', 'parse_status',
         'is_configuration_item', 'is_hidden', 'is_excluded',
         'guid', 'element_guid', 'has_sensitive_hint'
@@ -973,6 +1164,7 @@ function Export-AFAttributeInventory {
                         data_reference        = $dataReference
                         config_string         = $configString
                         resolved_server       = $parsed.resolved_server
+                        resolved_server_id    = $parsed.resolved_server_id
                         resolved_tag          = $parsed.resolved_tag
                         resolved_point_id     = $parsed.resolved_point_id
                         is_dynamic_reference  = $parsed.is_dynamic_reference
@@ -1161,7 +1353,7 @@ function Export-PIPointHealth {
     )
 
     try {
-        $filter = if ($PSBoundParameters.ContainsKey('NameFilter')) { $NameFilter } else { [string]$Context.Config.pi.pointNameFilter }
+        $filter = if ($PSBoundParameters.ContainsKey('NameFilter')) { $NameFilter } else { [string]$Context.EnvironmentConfig.pointNameFilter }
         if ([string]::IsNullOrWhiteSpace($filter)) { $filter = '*' }
 
         $staleHours = [double]$Context.Config.thresholds.staleThresholdHours
@@ -1540,12 +1732,19 @@ function Export-AFEventFrameInventory {
     )
 
     try {
-        $days = if ($PSBoundParameters.ContainsKey('LookbackDays')) { $LookbackDays } else { [int]$Context.Config.thresholds.eventFrameLookbackDays }
+        $days = 0
+        if ($PSBoundParameters.ContainsKey('LookbackDays')) {
+            $days = $LookbackDays
+        }
+        elseif ($Context.EnvironmentConfig.PSObject.Properties['eventFrameLookbackDays']) {
+            $days = [int]$Context.EnvironmentConfig.eventFrameLookbackDays
+        }
+        if ($days -le 0) { $days = [int]$Context.Config.thresholds.eventFrameLookbackDays }
         if ($days -le 0) { $days = 30 }
 
         $templateFilter = @()
-        if ($Context.Config.pi.PSObject.Properties['eventFrameTemplates']) {
-            $templateFilter = @($Context.Config.pi.eventFrameTemplates) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        if ($Context.EnvironmentConfig.PSObject.Properties['eventFrameTemplates']) {
+            $templateFilter = @($Context.EnvironmentConfig.eventFrameTemplates) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
         }
 
         # Dentro de query string do AF Search a sintaxe de tempo do PI funciona. Ver armadilha 5.
@@ -1767,12 +1966,193 @@ function Export-AFAnalysisInventory {
         $written = Write-InventoryOutput -InputObject $rows.ToArray() -Dataset $dataset -Context $Context -Column $columns
         $stopwatch.Stop()
 
-        $status = if ($statusSource -eq 'QueryRuntimeInformation') { 'success' } else { 'degraded' }
+        # Degradação declarada em knownDegradations fica visível no dado, mas não eleva o exit
+        # code: se um ambiente sabidamente sem status de runtime marcasse o run como degradado
+        # todo dia, o código 2 deixaria de ser sinal.
+        $status = 'success'
+        $knownDegradation = $null
+        if ($statusSource -ne 'QueryRuntimeInformation') {
+            $knownDegradation = Get-KnownDegradation -Context $Context -Dataset $dataset -Signal $statusSource
+            if ($null -ne $knownDegradation) {
+                Write-InventoryLog -Dataset $dataset -Message ("Degradação declarada '{0}': {1}" -f $statusSource, $knownDegradation.reason)
+            }
+            else {
+                $status = 'degraded'
+            }
+        }
+
         Write-InventoryLog -Dataset $dataset -Message ('{0} analyses, {1} em erro, {2} ms.' -f $written.row_count, $errorCount, $stopwatch.ElapsedMilliseconds)
 
         return Add-DatasetResult -Context $Context -Dataset $dataset -Status $status `
             -RowCount $written.row_count -DurationMs $stopwatch.ElapsedMilliseconds -File $written.file `
-            -Metrics @{ status_source = $statusSource; error_status_count = $errorCount }
+            -Metrics @{
+            status_source      = $statusSource
+            error_status_count = $errorCount
+            known_degradation  = $(if ($null -ne $knownDegradation) { [string]$knownDegradation.signal } else { $null })
+        }
+    }
+    catch {
+        $stopwatch.Stop()
+        Write-InventoryLog -Level ERROR -Dataset $dataset -Message $_.Exception.Message
+        return Add-DatasetResult -Context $Context -Dataset $dataset -Status 'failed' `
+            -RowCount 0 -DurationMs $stopwatch.ElapsedMilliseconds -ErrorMessage $_.Exception.Message
+    }
+}
+
+function Export-AFAnalysisOutputInventory {
+    <#
+        .SYNOPSIS
+            Exporta as saídas de cada analysis: qual atributo ela escreve e em qual tag.
+        .DESCRIPTION
+            Uma linha por par (analysis, atributo de saída). O dataset `analyses` tem grão de
+            analysis; este tem grão de saída, porque uma analysis pode escrever em vários atributos.
+
+            É o que permite detectar escrita concorrente — duas analyses de camadas diferentes
+            gravando na mesma tag do mesmo Data Archive:
+
+                SELECT resolved_server_id, resolved_tag, COUNT(DISTINCT environment)
+                FROM silver_analysis_output
+                GROUP BY 1, 2
+                HAVING COUNT(DISTINCT environment) > 1
+
+            A tag sai do ConfigString do atributo de saída, com o mesmo parser do dataset
+            `attributes`. O `resolved_server_id` é indispensável aqui: nomes de tag podem coincidir
+            entre camadas, GUID de Data Archive não.
+        .PARAMETER Context
+            Contexto devolvido por Initialize-PIConnection.
+        .OUTPUTS
+            PSCustomObject com dataset, status, row_count, duration_ms, file, error e metrics.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject] $Context
+    )
+
+    $dataset = 'analysis_outputs'
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    $columns = @(
+        'analysis_name', 'analysis_path', 'analysis_guid', 'analysis_template',
+        'target_path', 'variable_name', 'mapped_target', 'mapping_raw',
+        'output_attribute_name', 'output_attribute_path', 'output_element_path',
+        'data_reference', 'config_string',
+        'resolved_server', 'resolved_server_id', 'resolved_tag', 'resolved_point_id',
+        'parse_status', 'has_sensitive_hint'
+    )
+
+    try {
+        $patterns = $Context.SensitivePatterns
+        $rows = New-Object System.Collections.Generic.List[object]
+        $analysisCount = 0
+        $unreadable = 0
+        $mappedCount = 0
+
+        foreach ($analysis in $Context.AFDatabase.Analyses) {
+            $analysisCount++
+
+            $rule = $analysis.AnalysisRule
+            if ($null -eq $rule) { continue }
+
+            $mappingRaw = $null
+            try { $mappingRaw = [string]$rule.SimplifiedVariableMapping } catch { }
+            if ([string]::IsNullOrWhiteSpace($mappingRaw)) {
+                try { $mappingRaw = [string]$rule.VariableMapping } catch { }
+            }
+
+            # GetOutputs devolve o atributo real so quando a saida esta ligada a um elemento;
+            # caso contrario vem um placeholder 'Output' sem Element e sem Data Reference.
+            $realOutputs = New-Object System.Collections.Generic.List[object]
+            try {
+                foreach ($candidate in @($rule.GetOutputs())) {
+                    if ($null -ne $candidate -and $null -ne $candidate.Element) { $realOutputs.Add($candidate) }
+                }
+            }
+            catch { $unreadable++ }
+
+            $analysisPath = $(try { $analysis.GetPath() } catch { $null })
+            $targetPath = $(try { if ($null -ne $analysis.Target) { $analysis.Target.GetPath() } else { $null } } catch { $null })
+            $analysisGuid = [string]$analysis.ID
+            $templateName = Get-SafeName $analysis.Template
+
+            $entries = New-Object System.Collections.Generic.List[object]
+
+            if (-not [string]::IsNullOrWhiteSpace($mappingRaw)) {
+                foreach ($entry in $mappingRaw.Split(';')) {
+                    if ([string]::IsNullOrWhiteSpace($entry)) { continue }
+                    $parts = $entry.Split(@('||'), [System.StringSplitOptions]::None)
+                    $variable = $parts[0].Trim()
+                    $mapped = if ($parts.Count -gt 1) { $parts[1].Trim() } else { $null }
+
+                    if ($variable -eq '[GUID]') { continue }
+                    if ($mapped -eq '[UNSET]' -or [string]::IsNullOrWhiteSpace($mapped)) { continue }
+
+                    $entries.Add([pscustomobject]@{ Variable = $variable; Mapped = $mapped })
+                }
+            }
+
+            if ($entries.Count -eq 0 -and $realOutputs.Count -eq 0) { continue }
+
+            $index = 0
+            foreach ($entry in $entries) {
+                # O atributo real, quando existe, vem na mesma ordem das saidas declaradas.
+                $attribute = if ($index -lt $realOutputs.Count) { $realOutputs[$index] } else { $null }
+
+                $dataReference = $null
+                $configString = $null
+                if ($null -ne $attribute) {
+                    try { $dataReference = Get-SafeName $attribute.DataReferencePlugIn } catch { }
+                    try { $configString = [string]$attribute.ConfigString } catch { }
+                }
+
+                $parsed = ConvertFrom-AFConfigString -ConfigString $configString -DataReference $dataReference
+                if ($parsed.resolved_tag) { $mappedCount++ }
+
+                $rows.Add([pscustomobject]@{
+                        analysis_name         = $analysis.Name
+                        analysis_path         = $analysisPath
+                        analysis_guid         = $analysisGuid
+                        analysis_template     = $templateName
+                        target_path           = $targetPath
+                        variable_name         = $entry.Variable
+                        mapped_target         = $entry.Mapped
+                        mapping_raw           = $mappingRaw
+                        output_attribute_name = $(if ($null -ne $attribute) { $attribute.Name } else { $null })
+                        output_attribute_path = $(if ($null -ne $attribute) { try { $attribute.GetPath() } catch { $null } } else { $null })
+                        output_element_path   = $(if ($null -ne $attribute) { try { $attribute.Element.GetPath() } catch { $null } } else { $null })
+                        data_reference        = $dataReference
+                        config_string         = $configString
+                        resolved_server       = $parsed.resolved_server
+                        resolved_server_id    = $parsed.resolved_server_id
+                        resolved_tag          = $parsed.resolved_tag
+                        resolved_point_id     = $parsed.resolved_point_id
+                        parse_status          = $parsed.parse_status
+                        has_sensitive_hint    = Test-SensitiveHint -Value @($configString) -Pattern $patterns
+                    })
+
+                $index++
+            }
+        }
+
+        if ($unreadable -gt 0) {
+            Write-InventoryLog -Level WARN -Dataset $dataset -Message "$unreadable analyses não expuseram suas saídas."
+        }
+
+        $written = Write-InventoryOutput -InputObject $rows.ToArray() -Dataset $dataset -Context $Context -Column $columns
+        $stopwatch.Stop()
+
+        Write-InventoryLog -Dataset $dataset -Message (
+            '{0} saídas mapeadas de {1} analyses ({2} com tag já resolvida na extração), {3} ms.' -f
+            $written.row_count, $analysisCount, $mappedCount, $stopwatch.ElapsedMilliseconds
+        )
+
+        return Add-DatasetResult -Context $Context -Dataset $dataset -Status 'success' `
+            -RowCount $written.row_count -DurationMs $stopwatch.ElapsedMilliseconds -File $written.file `
+            -Metrics @{
+            analysis_count     = $analysisCount
+            unreadable_count   = $unreadable
+            resolved_tag_count = $mappedCount
+        }
     }
     catch {
         $stopwatch.Stop()
@@ -1968,10 +2348,11 @@ function Get-InventoryDatasetMap {
         'attributes'     = 'Export-AFAttributeInventory'
         'templates'      = 'Export-AFTemplateInventory'
         'eventframes'    = 'Export-AFEventFrameInventory'
-        'analyses'       = 'Export-AFAnalysisInventory'
-        'enumsets'       = 'Export-AFEnumerationSetInventory'
-        'uom'            = 'Export-AFUomInventory'
-        'tables'         = 'Export-AFTableInventory'
+        'analyses'         = 'Export-AFAnalysisInventory'
+        'analysis_outputs' = 'Export-AFAnalysisOutputInventory'
+        'enumsets'         = 'Export-AFEnumerationSetInventory'
+        'uom'              = 'Export-AFUomInventory'
+        'tables'           = 'Export-AFTableInventory'
     }
 }
 
@@ -2012,6 +2393,11 @@ function Write-InventoryManifest {
     $manifest = [ordered]@{
         run_id                  = $Context.RunId
         run_type                = $Context.RunType
+        environment             = $Context.Environment
+        environment_name        = $Context.EnvironmentName
+        tier                    = $Context.Tier
+        site                    = $Context.Site
+        site_name               = $Context.SiteName
         snapshot_date           = $Context.SnapshotDate
         snapshot_stamp          = $Context.SnapshotStamp
         snapshot_ts             = $Context.SnapshotTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fffK")
@@ -2020,11 +2406,15 @@ function Write-InventoryManifest {
         module_version          = $Context.ModuleVersion
         machine                 = $env:COMPUTERNAME
         user                    = "$env:USERDOMAIN\$env:USERNAME"
-        pi_data_archive         = $Context.PIServer.Name
+        pi_data_archive         = $Context.SourceServer
+        pi_data_archive_id      = $Context.SourceServerId
         pi_data_archive_version = [string]$Context.PIServer.ServerVersion
-        af_server               = $Context.PISystem.Name
+        af_server               = $Context.SourceAFServer
+        af_server_id            = $Context.SourceAFServerId
         af_server_version       = [string]$Context.PISystem.ServerVersion
-        af_database             = $Context.AFDatabase.Name
+        af_database             = $Context.SourceAFDatabase
+        af_database_id          = $Context.SourceAFDatabaseId
+        known_degradations      = @($Context.EnvironmentConfig.knownDegradations)
         output_root             = $Context.BaseDir
         used_fallback_dir       = $Context.UsedFallbackDir
         dataset_count           = $datasets.Count
@@ -2034,7 +2424,7 @@ function Write-InventoryManifest {
         datasets                = $datasets
     }
 
-    $fileName = '_manifest__{0}__{1}.json' -f $Context.RunType, $Context.SnapshotStamp
+    $fileName = '_manifest__{0}__{1}__{2}.json' -f $Context.RunType, $Context.Environment, $Context.SnapshotStamp
     $path = Join-Path $Context.SnapshotPath $fileName
 
     $json = $manifest | ConvertTo-Json -Depth 8
@@ -2108,7 +2498,7 @@ function Copy-InventorySnapshot {
             }
 
             $files = New-Object System.Collections.Generic.List[object]
-            foreach ($file in Get-ChildItem -LiteralPath $Context.SnapshotPath -Filter ('*__{0}.csv' -f $Context.SnapshotStamp) -File) {
+            foreach ($file in Get-ChildItem -LiteralPath $Context.SnapshotPath -Filter ('*__{0}__{1}.csv' -f $Context.Environment, $Context.SnapshotStamp) -File) {
                 $files.Add($file)
             }
             if ($ManifestFile) {
@@ -2147,7 +2537,7 @@ function Copy-InventorySnapshot {
         Write-InventoryLog -Level $level -Message ('Transferência {0}: {1} de {2} arquivos para {3}.' -f $result.status, $result.files_copied, $result.files_expected, $result.target)
     }
 
-    $transferFile = '_transfer__{0}__{1}.json' -f $Context.RunType, $Context.SnapshotStamp
+    $transferFile = '_transfer__{0}__{1}__{2}.json' -f $Context.RunType, $Context.Environment, $Context.SnapshotStamp
     $transferPath = Join-Path $Context.SnapshotPath $transferFile
     $json = ([pscustomobject]$result) | ConvertTo-Json -Depth 4
     [System.IO.File]::WriteAllText($transferPath, $json, (New-Object System.Text.UTF8Encoding($false)))
@@ -2291,6 +2681,8 @@ function Invoke-InventorySnapshot {
 
         [string] $ConfigPath,
 
+        [string[]] $Environment,
+
         [string[]] $Dataset,
 
         [switch] $SkipTransfer,
@@ -2300,70 +2692,133 @@ function Invoke-InventorySnapshot {
 
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-    $context = $null
     try {
-        $initArgs = @{ RunType = $RunType }
-        if ($PSBoundParameters.ContainsKey('ConfigPath') -and $ConfigPath) { $initArgs['ConfigPath'] = $ConfigPath }
-        $context = Initialize-PIConnection @initArgs
+        $environments = @(Get-InventoryEnvironment -ConfigPath $ConfigPath)
     }
     catch {
-        $stopwatch.Stop()
-        Write-InventoryLog -Level ERROR -Message "Falha fatal na inicialização: $($_.Exception.Message)"
-        return [pscustomobject]@{
-            ExitCode  = 1
-            Context   = $null
-            Manifest  = $null
-            Transfer  = $null
-            Retention = $null
-        }
+        Write-InventoryLog -Level ERROR -Message "Falha fatal ao ler a configuração: $($_.Exception.Message)"
+        return [pscustomobject]@{ ExitCode = 1; Runs = @(); Retention = $null }
     }
 
-    $map = Get-InventoryDatasetMap
-    $requested = if ($Dataset -and $Dataset.Count -gt 0) { $Dataset } else { @($context.Config.datasets.$RunType) }
+    if ($Environment -and $Environment.Count -gt 0) {
+        $environments = @($environments | Where-Object { $Environment -contains $_.id })
+    }
 
-    foreach ($name in $requested) {
-        if (-not $map.Contains($name)) {
-            Write-InventoryLog -Level WARN -Message "Dataset '$name' não tem função registrada; ignorado."
+    if ($environments.Count -eq 0) {
+        Write-InventoryLog -Level ERROR -Message 'Nenhum ambiente habilitado corresponde ao filtro.'
+        return [pscustomobject]@{ ExitCode = 1; Runs = @(); Retention = $null }
+    }
+
+    $runs = New-Object System.Collections.Generic.List[object]
+    $exitCode = 0
+    $lastContext = $null
+
+    foreach ($environmentConfig in $environments) {
+        $envStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $context = $null
+
+        try {
+            $initArgs = @{ RunType = $RunType; Environment = $environmentConfig.id }
+            if ($PSBoundParameters.ContainsKey('ConfigPath') -and $ConfigPath) { $initArgs['ConfigPath'] = $ConfigPath }
+            $context = Initialize-PIConnection @initArgs
+        }
+        catch {
+            # Um ambiente fora do ar não pode derrubar a coleta dos demais.
+            $envStopwatch.Stop()
+            Write-InventoryLog -Level ERROR -Message ("Ambiente '{0}' inacessível: {1}" -f $environmentConfig.id, $_.Exception.Message)
+            $exitCode = 2
+            $runs.Add([pscustomobject]@{
+                    Environment = [string]$environmentConfig.id
+                    ExitCode    = 1
+                    Context     = $null
+                    Manifest    = $null
+                    Transfer    = $null
+                    Error       = $_.Exception.Message
+                })
             continue
         }
 
-        $functionName = $map[$name]
-        try {
-            & $functionName -Context $context | Out-Null
+        $lastContext = $context
+        $map = Get-InventoryDatasetMap
+        $requested = if ($Dataset -and $Dataset.Count -gt 0) { $Dataset } else { @($context.Config.datasets.$RunType) }
+        $unknown = 0
+
+        foreach ($name in $requested) {
+            if (-not $map.Contains($name)) {
+                Write-InventoryLog -Level WARN -Message "Dataset '$name' não tem função registrada; ignorado."
+                $unknown++
+                continue
+            }
+
+            $functionName = $map[$name]
+            try {
+                & $functionName -Context $context | Out-Null
+            }
+            catch {
+                # Os exports já capturam suas falhas; isto cobre erro na própria invocação.
+                Write-InventoryLog -Level ERROR -Dataset $name -Message "Invocação de $functionName falhou: $($_.Exception.Message)"
+                Add-DatasetResult -Context $context -Dataset $name -Status 'failed' -RowCount 0 -DurationMs 0 -ErrorMessage $_.Exception.Message | Out-Null
+            }
         }
-        catch {
-            # Os exports já capturam suas falhas; isto cobre erro na própria invocação.
-            Write-InventoryLog -Level ERROR -Dataset $name -Message "Invocação de $functionName falhou: $($_.Exception.Message)"
-            Add-DatasetResult -Context $context -Dataset $name -Status 'failed' -RowCount 0 -DurationMs 0 -ErrorMessage $_.Exception.Message | Out-Null
+
+        $envStopwatch.Stop()
+        $manifest = Write-InventoryManifest -Context $context -DurationMs $envStopwatch.ElapsedMilliseconds
+
+        $transfer = $null
+        if (-not $SkipTransfer) {
+            $transfer = Copy-InventorySnapshot -Context $context -ManifestFile $manifest.file
         }
+
+        $envExit = 0
+        if ($manifest.status -ne 'success') { $envExit = 2 }
+        if ($null -ne $transfer -and $transfer.status -notin @('success', 'skipped')) { $envExit = 2 }
+
+        # Um run que não coletou nada não é sucesso, mesmo sem nenhuma falha registrada.
+        if ($unknown -gt 0) {
+            Write-InventoryLog -Level WARN -Message "$unknown nome(s) de dataset sem função registrada."
+            $envExit = 2
+        }
+        if ($context.Datasets.Count -eq 0) {
+            Write-InventoryLog -Level ERROR -Message 'Nenhum dataset foi coletado neste ambiente.'
+            $envExit = 2
+        }
+
+        if ($envExit -gt $exitCode) { $exitCode = $envExit }
+
+        Write-InventoryLog -Message (
+            'Ambiente {0} concluído em {1:N1} s com exit code {2}.' -f
+            $environmentConfig.id, ($envStopwatch.ElapsedMilliseconds / 1000), $envExit
+        )
+
+        $runs.Add([pscustomobject]@{
+                Environment = [string]$environmentConfig.id
+                ExitCode    = $envExit
+                Context     = $context
+                Manifest    = $manifest
+                Transfer    = $transfer
+                Error       = $null
+            })
     }
 
-    $stopwatch.Stop()
+    # Nenhum ambiente produziu dado: isso é falha fatal, não degradação.
+    if (@($runs | Where-Object { $null -ne $_.Context }).Count -eq 0) { $exitCode = 1 }
 
-    $manifest = Write-InventoryManifest -Context $context -DurationMs $stopwatch.ElapsedMilliseconds
-
-    $transfer = $null
-    if (-not $SkipTransfer) {
-        $transfer = Copy-InventorySnapshot -Context $context -ManifestFile $manifest.file
-    }
-
+    # A retenção varre a pasta datada inteira, então roda uma vez só, no fim.
     $retention = $null
-    if (-not $SkipRetention) {
-        try { $retention = Remove-ExpiredSnapshot -Context $context }
+    if (-not $SkipRetention -and $null -ne $lastContext) {
+        try { $retention = Remove-ExpiredSnapshot -Context $lastContext }
         catch { Write-InventoryLog -Level WARN -Message "Retenção não executada: $($_.Exception.Message)" }
     }
 
-    $exitCode = 0
-    if ($manifest.status -ne 'success') { $exitCode = 2 }
-    if ($null -ne $transfer -and $transfer.status -notin @('success', 'skipped')) { $exitCode = 2 }
-
-    Write-InventoryLog -Message ('Execução {0} concluída em {1:N1} s com exit code {2}.' -f $RunType, ($stopwatch.ElapsedMilliseconds / 1000), $exitCode)
+    $stopwatch.Stop()
+    Write-InventoryLog -Message (
+        'Execução {0} concluída em {1:N1} s, {2} ambiente(s), exit code {3}.' -f
+        $RunType, ($stopwatch.ElapsedMilliseconds / 1000), $runs.Count, $exitCode
+    )
 
     return [pscustomobject]@{
         ExitCode  = $exitCode
-        Context   = $context
-        Manifest  = $manifest
-        Transfer  = $transfer
+        Runs      = $runs.ToArray()
         Retention = $retention
     }
 }
@@ -2372,6 +2827,7 @@ function Invoke-InventorySnapshot {
 
 Export-ModuleMember -Function @(
     'Import-PISdk',
+    'Get-InventoryEnvironment',
     'Initialize-PIConnection',
     'Write-InventoryLog',
     'Write-InventoryOutput',
@@ -2389,6 +2845,7 @@ Export-ModuleMember -Function @(
     'Export-AFTemplateInventory',
     'Export-AFEventFrameInventory',
     'Export-AFAnalysisInventory',
+    'Export-AFAnalysisOutputInventory',
     'Export-AFEnumerationSetInventory',
     'Export-AFUomInventory',
     'Export-AFTableInventory'

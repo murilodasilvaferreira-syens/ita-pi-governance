@@ -1,6 +1,109 @@
 # Arquitetura
 
-## Visão geral
+## Topologia: Ring 0 e Ring 1
+
+A empresa organiza o PI em duas camadas permanentes que coexistem por desenho — **não é migração**,
+não há lado "legado".
+
+```
+Ring 0: Site                          Ring 1: Cloud
+───────────────────                 ───────────────────────────
+BRITAMS01-SV01        ──tags──►       ASEW1PSTEKPDA01   (PI Data Archive)
+  DA: ITA_NOVECARE                      ASEW1PSTEKPAF02   (todos os AF Novecare)
+  AF DB: ITA_NOVECARE   ──EF────►       ASEW1PSTEKPAF03   (todos os AF Tech Soln)
+                                        pivision.syensqo.com · SEEQ
+```
+
+- **Ring 0** — servidor no chão de fábrica, escopo de um site
+- **Ring 1** — infraestrutura cloud corporativa, agrega todos os sites Novecare
+
+| Ambiente | `tier` | Data Archive | AF Server | AF Database |
+|---|---|---|---|---|
+| `ita-site` | `site` | `ITA_NOVECARE` · `349d4525…` | `BRITAMS01-SV01` · `136b3cdd…` | `ITA_NOVECARE` · `9d02f7c2…` |
+| `ita-cloud` | `cloud` | `ASEW1PSTEKPDA01` · `55d60fe8…` | `asew1pstekpAF02` · `ec1a3fec…` | `ITA_NOVECARE` · `58ec8775…` |
+
+### ⚠️ Os dois `ITA_NOVECARE` não são réplica
+
+O diagrama corporativo sugere fluxo site → cloud, o que levaria a supor que a base da cloud é cópia
+da base do site. **Os GUIDs provam o contrário:** `9d02f7c2…` e `58ec8775…` são objetos
+independentes que evoluíram separadamente — 391 analyses no site contra 420 na cloud.
+
+> O diagrama descreve a intenção arquitetural. O GUID descreve a realidade. **Confie no GUID.**
+
+Daí a existência do dataset `analysis_outputs`: se as duas camadas têm analyses próprias, pode
+haver duas escrevendo na mesma tag. Ver "Escrita concorrente entre camadas" abaixo.
+
+## Identidade: nome é rótulo, GUID é chave
+
+Todo dataset carrega onze colunas de identidade. Duas delas são facilmente confundidas e a
+distinção é o coração do modelo:
+
+| Coluna | Significado |
+|---|---|
+| `source_server_id` | GUID do Data Archive **de onde a linha foi extraída** |
+| `resolved_server_id` | GUID do Data Archive **para onde o ConfigString aponta** |
+
+**Divergir entre as duas é sinal, não erro.** No AF da cloud, 321 atributos têm
+`resolved_server_id = 349d4525…` (o DA do site) enquanto `source_server_id = 55d60fe8…`. Isso é
+uma referência cruzada real entre camadas — a cloud lendo dado do site. Sobrescrever uma coluna
+com a outra destruiria exatamente essa evidência.
+
+As demais colunas de identidade:
+
+| Coluna | Conteúdo |
+|---|---|
+| `environment` | `ita-site` / `ita-cloud` — chave estável, sobrevive a rename de servidor |
+| `tier` | `site` / `cloud` |
+| `site` / `site_name` | `ITA` para join, `Itatiba` para exibição |
+| `source_server` | nome do Data Archive (informativo) |
+| `source_af_server` / `source_af_server_id` | vazios nos datasets que vêm só do Data Archive |
+| `source_af_database` / `source_af_database_id` | idem |
+
+Chaves resultantes:
+
+- **Join AF↔PI:** `(resolved_server_id, resolved_tag)` — ou `resolved_point_id`, imune a rename
+- **Identidade de objeto AF:** `(source_af_server_id, source_af_database_id, path)`
+
+Nunca use nome como chave. O mesmo Data Archive aparece com quatro grafias nos ConfigStrings
+(`BRITAMS01-SV01`, o FQDN, `ITA_NOVECARE`, `BRITAMS01-SV01.oxo.priv`) e dois AF Databases distintos
+se chamam `ITA_NOVECARE`. Pior: `Configuration` tem o **mesmo GUID** nos dois AF Servers, então nem
+GUID de database é globalmente único — só o par com o AF Server desempata.
+
+## Contrato de nome de arquivo
+
+O nome é contrato de dados: o Dataflow Gen2 deriva `dataset`, `environment` e `snapshot_ts` dele.
+
+```
+<dataset>__<environment>__<yyyyMMdd>T<HHmmss>.csv
+_manifest__<run_type>__<environment>__<yyyyMMdd>T<HHmmss>.json
+_transfer__<run_type>__<environment>__<yyyyMMdd>T<HHmmss>.json   (local, nunca copiado)
+```
+
+**Parse por prefixo, nunca por contagem de segmentos** — assim novos segmentos no futuro não quebram
+a regra:
+
+```
+começa com "_manifest"  → manifesto: campo 2 = run_type, campo 3 = environment
+caso contrário          → dataset:   campo 1 = dataset,  campo 2 = environment
+```
+
+### Compatibilidade com os arquivos anteriores
+
+Os snapshots gerados antes desta mudança usam dois segmentos e não têm `environment`:
+
+```
+pipoints__20260806T193126.csv
+```
+
+Todos vieram do `britams01`, então o default é `ita-site`. **Não é preciso reprocessar** — uma linha
+no Power Query resolve a convivência:
+
+```powerquery
+let p = Text.Split(Text.BeforeDelimiter([Name], "."), "__")
+in  if List.Count(p) >= 3 then p{List.Count(p) - 2} else "ita-site"
+```
+
+## Visão geral do fluxo
 
 ```
 [MÁQUINA COM PI SDK]                          [NUVEM]
@@ -230,6 +333,41 @@ alarme que ninguém lê. Três guardas:
 
 Três sinais separados (`tag_criada`, `tag_removida`, `atributo_alterado`) em vez de um delta único:
 misturá-los produz um alerta genérico que ninguém consegue acionar.
+
+## Escrita concorrente entre camadas
+
+A pergunta mais séria que este inventário permite responder: **duas analyses, em camadas
+diferentes, escrevendo na mesma tag?**
+
+O dataset `analysis_outputs` tem grão de (analysis, variável de saída) e guarda o mapeamento
+**cru**, sem resolver o caminho relativo:
+
+| Coluna | Conteúdo |
+|---|---|
+| `variable_name` | `vBatchStep_1631E50` |
+| `mapped_target` | `BatchName_K27\|BatchStep_163125` |
+| `mapping_raw` | a string completa de `SimplifiedVariableMapping` |
+
+Resolver `mapped_target` contra `target_path` até chegar no `ConfigString` do atributo é trabalho
+do silver — ver [armadilha 21](armadilhas.md) para o porquê. Depois de resolvido:
+
+```sql
+SELECT resolved_server_id, resolved_tag, COUNT(DISTINCT environment) AS n_camadas
+FROM silver_analysis_output
+WHERE resolved_tag IS NOT NULL
+GROUP BY resolved_server_id, resolved_tag
+HAVING COUNT(DISTINCT environment) > 1;
+```
+
+Qualquer linha é uma tag com dois escritores em camadas diferentes.
+
+## Divergência entre camadas
+
+O que existe no site e não na cloud, e vice-versa. Compara por `path` dentro do mesmo `site`,
+nunca por GUID — os objetos das duas camadas são independentes e têm GUIDs próprios.
+
+Sinais úteis: elemento presente só numa camada, atributo com `dr_status` diferente entre camadas,
+e analysis existente numa e ausente na outra.
 
 ## `has_ever_received_data` é heurístico — leia antes de usar
 > ⚠️ **Este sinal não é garantia.** Ele combina o estado de sistema `Pt Created` no snapshot com a

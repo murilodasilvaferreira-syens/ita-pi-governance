@@ -351,6 +351,65 @@ proibidos aparecem de propósito, gerando falsos positivos.
 
 ---
 
+## 20. Variável local colidindo com parâmetro tipado converte seu objeto em silêncio
+
+**Sintoma:** um objeto atribuído a uma variável vira string vazia, sem erro. O acesso a qualquer
+propriedade depois disso devolve nada.
+
+Nomes de variável em PowerShell são **case-insensitive**: `$Environment` e `$environment` são a
+**mesma variável**. Se o parâmetro declara um tipo, a restrição vale para toda atribuição posterior.
+
+```powershell
+function Initialize-PIConnection {
+    param([string] $Environment)          # parametro tipado
+
+    $environment = Resolve-Environment    # MESMA variavel: o objeto vira string
+    $environment.id                       # vazio, sem erro
+}
+```
+
+Foi assim que os dois ambientes falharam com `Index operation failed; the array index evaluated to
+null` — o nome do servidor chegava vazio em `$piServers[$nome]`.
+
+No módulo a variável local se chama `$environmentConfig` justamente por isso, com comentário no
+código para não ser "simplificada" de volta.
+
+> Regra prática: nunca use como variável local o nome de um parâmetro, nem variando maiúsculas.
+
+---
+
+## 21. `AnalysisRule.GetOutputs()` devolve placeholder, não a saída real
+
+**Sintoma:** um dataset de saídas de analyses que *parece* completo e tem 98% de lixo.
+
+Em 245 de 248 saídas o método devolveu um `AFAttribute` chamado `Output`, **sem `Element` e sem
+`DataReferencePlugIn`** — o placeholder da variável de saída não ligada a um atributo. Só 3 eram
+atributos reais.
+
+O mapeamento verdadeiro está em `SimplifiedVariableMapping`:
+
+```
+vBatchStep_1631E50||BatchName_K27|BatchStep_163125;
+```
+
+Formato `variavel||Elemento|Atributo`, entradas separadas por `;`. Em `VariableMapping` (a versão
+completa) aparecem também `[GUID]||{guid};` para as entradas e `[GUID]||[UNSET];` para saídas
+não mapeadas — ambas devem ser descartadas.
+
+O módulo grava o mapeamento **cru** (`variable_name`, `mapped_target`, `mapping_raw`) e não resolve
+o caminho relativo. Três motivos:
+
+- **Reprocessável.** Caminho relativo do AF é cheio de casos de borda. Errando no notebook, você
+  corrige e reprocessa o bronze; errando no extrator, cada correção exige nova janela de acesso ao PI.
+- **Auditável.** Com `mapping_raw` preservado dá para provar de onde veio cada resolução. No silver
+  uma resolução errada é detectável; no extrator ela vira dado silenciosamente errado.
+- **Barato.** Nenhuma chamada extra ao SDK por analysis.
+
+> Este é o modo de falha mais perigoso do projeto: **dado plausível e falso é pior que dado ausente.**
+> Sempre confira a taxa de preenchimento de um dataset novo antes de confiar nele.
+
+---
+
 ## Armadilhas de saída (descobertas fora do PI)
 
 Não são do PI System, mas quebram o pipeline do mesmo jeito.

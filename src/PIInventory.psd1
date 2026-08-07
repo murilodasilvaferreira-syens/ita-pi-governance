@@ -11,6 +11,7 @@
 
     FunctionsToExport = @(
         'Import-PISdk',
+        'Get-InventoryEnvironment',
         'Initialize-PIConnection',
         'Write-InventoryLog',
         'Write-InventoryOutput',
@@ -28,6 +29,7 @@
         'Export-AFTemplateInventory',
         'Export-AFEventFrameInventory',
         'Export-AFAnalysisInventory',
+        'Export-AFAnalysisOutputInventory',
         'Export-AFEnumerationSetInventory',
         'Export-AFUomInventory',
         'Export-AFTableInventory'
